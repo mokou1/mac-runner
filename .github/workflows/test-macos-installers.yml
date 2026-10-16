@@ -1,0 +1,125 @@
+name: Test macOS Installers
+
+# Manually-triggered E2E test of the LiteLLM proxy macOS install scripts
+# (setup-codex-macos.sh + setup-claude-code-macos.sh) served from the
+# company CDN. Verifies download, install, config generation, PATH/rc
+# hooks, and (for claude) the version layout — everything except the
+# live /v1 verification calls, which are skipped (--no-verify) so the
+# runner never calls the proxy with a real key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model slug to configure"
+        required: false
+        default: "zz-test-model"
+
+jobs:
+  test-arm64:
+    name: Test on ${{ matrix.runner }} (codex arch: ${{ matrix.codex-arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest      # arm64
+            codex-arch: arm64
+          - runner: macos-13          # x64
+            codex-arch: x64
+    steps:
+      - name: Download + run setup-codex-macos.sh
+        env:
+          BASE: https://a2agents-litellm.alpha2fund.cn:8443/install
+          MODEL: ${{ github.event.inputs.model || 'zz-test-model' }}
+        run: |
+          set -euxo pipefail
+          # fake key: install/config paths must work without touching the proxy
+          DATA="$(printf 'url=https://a2agents-litellm.alpha2fund.cn:8443\nkey=sk-CI-TEST-KEY' | base64)"
+          curl --insecure -fsSL "$BASE/setup-codex-macos.sh" -o setup-codex-macos.sh
+          bash setup-codex-macos.sh --data "$DATA" --model "$MODEL" --no-verify
+
+      - name: Assert codex install
+        env:
+          MODEL: ${{ github.event.inputs.model || 'zz-test-model' }}
+        run: |
+          set -euxo pipefail
+          test -x "$HOME/.local/bin/codex"
+          "$HOME/.local/bin/codex" --version
+          grep -q "model = \"$MODEL\"" "$HOME/.codex/config.toml"
+          grep -q "model_catalog_json" "$HOME/.codex/config.toml"
+          grep -q "base_url = \"https://a2agents-litellm.alpha2fund.cn:8443/v1\"" "$HOME/.codex/config.toml"
+          # catalog: custom model must appear via __MODEL__ substitution
+          grep -q "\"slug\": \"$MODEL\"" "$HOME/.codex/model-catalog.json"
+          grep -q "gpt-5.4" "$HOME/.codex/model-catalog.json"   # official list present too
+          # env.sh + CA bundle
+          grep -q "LITELLM_API_KEY" "$HOME/.codex/env.sh"
+          test -s "$HOME/.codex/ca-bundle.crt"
+          grep -q "BEGIN CERTIFICATE" "$HOME/.codex/ca-bundle.crt"
+          # rc hook present in zshrc
+          grep -q "litellm codex" "$HOME/.zshrc"
+
+      - name: Assert codex rc hook activates env (zsh)
+        shell: zsh {0}
+        run: |
+          set -euxo pipefail
+          source ~/.zshrc
+          test "$LITELLM_API_KEY" = "sk-CI-TEST-KEY"
+          test -n "${_codex_env_load_functions:-}" || type _codex_env_load >/dev/null
+          command -v codex
+
+      - name: Assert official-model catalog branch (dedup)
+        run: |
+          set -euxo pipefail
+          # re-run with an official model: catalog must switch to official-only
+          DATA="$(printf 'url=https://a2agents-litellm.alpha2fund.cn:8443\nkey=sk-CI-TEST-KEY' | base64)"
+          bash setup-codex-macos.sh --data "$DATA" --model gpt-5.4 --no-verify
+          n="$(grep -c '"slug": "gpt-5.4"' "$HOME/.codex/model-catalog.json")"
+          test "$n" -eq 1
+          ! grep -q '__MODEL__' "$HOME/.codex/model-catalog.json"
+
+      - name: Download + run setup-claude-code-macos.sh
+        env:
+          MODEL: claude-test-model
+        run: |
+          set -euxo pipefail
+          DATA="$(printf 'url=https://a2agents-litellm.alpha2fund.cn:8443\nkey=sk-CI-TEST-KEY' | base64)"
+          curl --insecure -fsSL "$BASE/setup-claude-code-macos.sh" -o setup-claude-code-macos.sh
+          BASE="https://a2agents-litellm.alpha2fund.cn:8443/install" \
+          bash setup-claude-code-macos.sh --data "$DATA" --model "$MODEL" --no-verify
+
+      - name: Assert claude install + upgrade path
+        run: |
+          set -euxo pipefail
+          test -x "$HOME/.local/bin/claude"
+          VER="$("$HOME/.local/bin/claude" --version)"
+          echo "installed: $VER"
+          case "$VER" in *"2.1.301"*|*"2.1.300"*) ;; *) echo "unexpected version: $VER"; exit 1;; esac
+          # settings.json merge result
+          "$PYTHON" - <<'PY'
+          import json, os
+          s = json.load(open(os.path.expanduser("~/.claude/settings.json")))
+          env = s["env"]
+          assert env["ANTHROPIC_BASE_URL"] == "https://a2agents-litellm.alpha2fund.cn:8443"
+          assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-CI-TEST-KEY"
+          assert env["ANTHROPIC_MODEL"] == "claude-test-model"
+          assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-test-model"
+          assert s["model"] == "claude-test-model"
+          assert s["autoCompactEnabled"] is True
+          assert s["skipWebFetchPreflight"] is True
+          print("settings.json OK")
+          PY
+
+      - name: Assert claude re-run is idempotent (up to date, no re-download)
+        run: |
+          set -euxo pipefail
+          DATA="$(printf 'url=https://a2agents-litellm.alpha2fund.cn:8443\nkey=sk-CI-TEST-KEY' | base64)"
+          out="$(bash setup-claude-code-macos.sh --data "$DATA" --model claude-test-model --no-verify 2>&1)"
+          echo "$out" | grep -F "already installed and up to date"
+
+  summary:
+    name: Summary
+    needs: [test-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All macOS installer checks passed on arm64 + x64"
