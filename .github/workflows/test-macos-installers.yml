@@ -17,7 +17,7 @@ on:
 
 jobs:
   test-arm64:
-    name: Test on ${{ matrix.runner }} (codex arch: ${{ matrix.codex-arch }})
+    name: "Test on ${{ matrix.runner }} (codex arch: ${{ matrix.codex-arch }})"
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
