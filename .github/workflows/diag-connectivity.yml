@@ -1,0 +1,33 @@
+name: Diag Connectivity
+
+# One-shot check of which company endpoints a GitHub-hosted macOS runner
+# can reach. Decides how the E2E installer test gets its files:
+#   - reachable  -> point INSTALL_BASE at the CDN directly
+#   - blocked    -> mirror the install files to GitHub release assets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    name: Diag on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+    matrix:
+      runner: [macos-latest, macos-13]
+    steps:
+      - name: DNS + TCP + HTTP checks
+        run: |
+          set -x
+          # what does the CDN hostname resolve to from here?
+          dig +short a2agents-litellm.alpha2fund.cn || true
+          # 8443 (nginx install endpoint)
+          curl --insecure -sS -m 20 -o /dev/null -w "8443: %{http_code} %{time_total}s\n" \
+            https://a2agents-litellm.alpha2fund.cn:8443/install/setup-codex-macos.sh || true
+          # 35009 (windows part server on the same IP)
+          curl -sS -m 20 -o /dev/null -w "35009: %{http_code} %{time_total}s\n" \
+            http://117.50.222.82:35009/ || true
+          # 28128 (litellm proxy itself)
+          curl -sS -m 20 -o /dev/null -w "28128: %{http_code} %{time_total}s\n" \
+            http://117.50.222.82:28128/ || true
